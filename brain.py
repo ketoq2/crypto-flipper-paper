@@ -133,16 +133,20 @@ def html_status(st, shared):
            ("Realized P/L", f"${sum(f['pnl'] for f in st['flips']):+.4f}"),
            ("Open exp P/L", f"${cand['exp']:+.4f}" if cand and st["state"] != "idle" else "—"),
            ("Total", f"{pct:+.3f}%"), ("Per day", f"{pct/days:+.3f}%"),
-           ("Flips done", str(len(st["flips"]))), ("State", st["state"]), ("Uptime", f"{days:.2f}d"),
-           ("Scan", f"{len(shared['cands'])} pairs" if shared["cands"] else "warming up")]
+           ("Flips done", str(len(st["flips"]))), ("State", f"{st['state']} ({st.get('strat','mm')})"),
+           ("Uptime", f"{days:.2f}d"),
+           ("Crash watch", f"{len(shared.get('hist', {}))} pairs" if shared.get("hist") else "warming up")]
     cards = "".join(f"<div class=c><div class=k>{k}</div><div class=v>{v}</div></div>" for k, v in kpi)
     nxt = "".join(f"<tr><td>{'★ ' if i == 0 else ''}{c['symbol']}{' (current)' if c['symbol'] == st['symbol'] else ''}</td>"
                   f"<td>{c['gross_pct']:.3f}</td><td>{c['net_pct']:.3f}</td><td>{c['vol24h']:,.0f}</td>"
                   f"<td>{c['exp']:+.4f}</td><td>{c['fill_min']:.1f}</td>"
                   f"<td class=l>{c['why']}</td></tr>" for i, c in enumerate(shared["cands"][:12]))
     flips = "".join(f"<tr><td>{fmt_t(f['t'])}</td><td>{f.get('sym', st['symbol'])}</td>"
+                    f"<td>{f.get('strat','mm')}</td>"
                     f"<td>{f['qty']:.4f}</td><td>{f['buy']:.6g}</td><td>{f['sell']:.6g}</td>"
                     f"<td>{f['fees']:.4f}</td><td>{f['pnl']:+.4f}</td></tr>" for f in reversed(st["flips"][-30:]))
+    watch = (" · Crash watch top droppers (15m): " +
+             ", ".join(f"{s} {r}" for s, r in shared.get("droppers", []))) if shared.get("droppers") else ""
     decisions = "".join(f"<tr><td>{fmt_t(d['t'])}</td><td class=l>{d['line']}</td></tr>"
                         for d in reversed(st.get("log", [])[-40:]))
     return f"""<!doctype html><meta http-equiv=refresh content=8><title>Paper trader</title>
@@ -152,10 +156,13 @@ def html_status(st, shared):
 h3{{margin:22px 0 6px}}table{{border-collapse:collapse}}td,th{{padding:4px 12px;border-bottom:1px solid #2a303a;text-align:right;font-size:13px}}
 td.l,th.l{{text-align:left}}.note{{color:#8899aa;margin-top:12px;font-size:13px}}</style>
 <h2>Paper trader — local fast loop</h2>
-<p class=note>Rules: pick the pair with the widest spread after fees (rescans every {SCAN_EVERY_S//60}m) ·
-quote buy at best bid only when spread &gt; {ROUND_TRIP_FEE*100:.2f}% round-trip fees · on fill, sell at best ask,
-chase down if undercut · requote if outbid · buy timeout {BUY_TIMEOUT_S//60}m · fee {FEE*100:.1f}%/side ·
-bankroll fully deployed on one flip at a time.</p>
+<p class=note>MM rules: pick the pair with the widest spread after fees (rescans every {SCAN_EVERY_S//60}m) ·
+quote buy at best bid only when spread &gt; {ROUND_TRIP_FEE*100:.2f}% round-trip fees · never cancel while still
+at the best bid (queue position is earned) · requote if outbid · on fill, sell at best ask, chase down if undercut ·
+fee {FEE*100:.1f}%/side · bankroll fully deployed on one flip at a time.<br>
+CRASH rules (priority, all liquid USDT pairs): 15m drop ≥ {CRASH_DROP*100:.0f}% + 15m volume ≥ {CRASH_VOL_MULT:.0f}× day
+baseline → limit buy at bid, fill-or-forget {CRASH_BUY_TIMEOUT_S//60}m, sell +{CRASH_TARGET*100:.0f}% fixed,
+bail at bid after {CRASH_DUMP_S//3600}h · evicts an unfilled MM buy · {CRASH_COOLDOWN_S//60}m per-pair cooldown.{watch}</p>
 <div class=cards>{cards}</div>
 <h3>Open flip</h3>
 <table><tr><th class=l>pair</th><th>side</th><th>price</th><th>qty</th><th>notional</th><th>exp P/L $</th><th>elapsed</th><th>est fill</th></tr>
@@ -163,7 +170,7 @@ bankroll fully deployed on one flip at a time.</p>
 <h3>Next buys (what it will buy and why — ★ = next up)</h3>
 <table><tr><th class=l>pair</th><th>gross %</th><th>net %</th><th>vol 24h $</th><th>exp $/flip</th><th>est m/leg</th><th class=l>why</th></tr>{nxt}</table>
 <h3>Flips done</h3>
-<table><tr><th>closed</th><th>pair</th><th>qty</th><th>buy</th><th>sell</th><th>fees $</th><th>pnl $</th></tr>{flips}</table>
+<table><tr><th>closed</th><th>pair</th><th>strat</th><th>qty</th><th>buy</th><th>sell</th><th>fees $</th><th>pnl $</th></tr>{flips}</table>
 <h3>Decisions</h3><table><tr><th>when</th><th class=l>decision</th></tr>{decisions}</table>
 <p class=note>Fills are queue-modeled: orders wait behind the resting size at their price; cancels ahead assumed never (conservative). Icebergs/hidden size not visible.
 Est fill = notional / per-minute volume × 4 (rough). Hosted 15-min twin (fixed ONEUSDT):
@@ -181,7 +188,9 @@ def cmd_paper(symbol, cash):
               "state": "idle", "order_price": 0, "qty": 0, "buy_cost": 0, "opened": 0,
               "last_id": None, "flips": []}
     st.setdefault("log", [])
-    shared = {"line": "starting", "cands": []}
+    st.setdefault("strat", "mm")
+    shared = {"line": "starting", "cands": [], "hist": {}, "vol24": {}, "droppers": [],
+              "cooldown": {}, "hist_t": 0.0}
 
     def note(line):
         print(f"[{time.strftime('%H:%M:%S')}] {line}")
@@ -190,11 +199,56 @@ def cmd_paper(symbol, cash):
     def scanner():
         while True:
             try:
-                cands = scan_candidates(get("ticker/bookTicker"), get("ticker/24hr"))
+                day = get("ticker/24hr")
+                shared["vol24"] = {d["symbol"]: float(d["quoteVolume"]) for d in day
+                                   if not bad_symbol(d["symbol"])
+                                   and float(d["quoteVolume"]) >= MIN_QUOTE_VOL_24H}
+                cands = scan_candidates(get("ticker/bookTicker"), day)
                 shared["cands"] = [enrich(c, st["cash"]) for c in cands[:15]]
             except Exception as e:
                 print(f"[warn] scan: {e}")
             time.sleep(SCAN_EVERY_S)
+
+    def crash_watch(now):
+        """All-pairs mid snapshot every HIST_EVERY_S; fire H1 when a liquid pair drops
+        CRASH_DROP in 15m AND the slot is free. Volume is confirmed via klines on trigger."""
+        if now - shared["hist_t"] < HIST_EVERY_S or not shared["vol24"]:
+            return None
+        shared["hist_t"] = now
+        rows = {b["symbol"]: b for b in get("ticker/bookTicker") if b["symbol"] in shared["vol24"]}
+        drops = []
+        for sym, b in rows.items():
+            bid, ask = float(b["bidPrice"]), float(b["askPrice"])
+            if bid <= 0 or ask <= bid:
+                continue
+            h = shared["hist"].setdefault(sym, [])
+            h.append((now, (bid + ask) / 2))
+            while h and h[0][0] < now - HIST_WINDOW_S:
+                h.pop(0)
+            past = [p for t, p in h if t <= now - 870]          # ~15 min ago
+            if past:
+                drops.append((h[-1][1] / past[-1] - 1, sym, bid, float(b["bidQty"])))
+        drops.sort()
+        shared["droppers"] = [(f"{s}", f"{r*100:+.2f}%") for r, s, *_ in drops[:3]]
+        slot_free = st["state"] == "idle" or (st["state"] == "buying" and st["filled"] == 0)
+        for r, sym, bid, bid_qty in drops:
+            if r > -CRASH_DROP:
+                break
+            if shared["cooldown"].get(sym, 0) > now or not slot_free:
+                continue
+            k = get("klines", {"symbol": sym, "interval": "1m", "limit": 1440})
+            qv = [float(row[7]) for row in k]
+            if sum(qv[-15:]) < CRASH_VOL_MULT * (sum(qv) / 96):
+                note(f"crash on {sym} ({r*100:+.1f}%/15m) but volume thin, skipped")
+                shared["cooldown"][sym] = now + CRASH_COOLDOWN_S
+                continue
+            shared["cooldown"][sym] = now + CRASH_COOLDOWN_S
+            st.update(symbol=sym, last_id=None, state="buying", strat="crash",
+                      order_price=bid, qty=st["cash"] / bid, queue=bid_qty,
+                      filled=0.0, opened=now)
+            return (f"CRASH {sym} {r*100:+.1f}%/15m on volume — limit buy @ {bid:.6g}, "
+                    f"target +{CRASH_TARGET*100:.0f}%, bail {CRASH_DUMP_S//3600}h")
+        return None
 
     threading.Thread(target=scanner, daemon=True).start()
 
@@ -212,9 +266,13 @@ def cmd_paper(symbol, cash):
     print(f"paper-trading {st['symbol']}, fee {FEE*100:.1f}%/side, dashboard http://127.0.0.1:{DASH_PORT}")
     while True:
         try:
-            picked = choose_symbol(st, shared["cands"])
-            if picked:
-                note(picked)
+            fired = crash_watch(time.time())
+            if fired:
+                note(fired)
+            elif st.get("strat") != "crash":
+                picked = choose_symbol(st, shared["cands"])
+                if picked:
+                    note(picked)
             book = get("ticker/bookTicker", {"symbol": st["symbol"]})
             trades, st["last_id"] = trades_since(st["symbol"], st["last_id"])
             line = step(st, float(book["bidPrice"]), float(book["askPrice"]),
@@ -258,6 +316,16 @@ def trades_since(symbol, last_id):
 SELL_DUMP_S = 2 * 3600   # unsold after 2h -> dump remainder at the bid (cross the spread to exit)
 EPS = 1e-9
 
+# H1 deep-crash reversion (research/bt.py, survived out-of-sample 2025-07..2026-07)
+CRASH_DROP = 0.08          # 15m drop that triggers
+CRASH_VOL_MULT = 3.0       # 15m quote volume vs day baseline
+CRASH_TARGET = 0.02        # sell limit above entry
+CRASH_BUY_TIMEOUT_S = 180  # fill-or-forget: bounce without us = no trade
+CRASH_DUMP_S = 4 * 3600    # research timeout: bail at 4h
+CRASH_COOLDOWN_S = 3600    # per-symbol retrigger guard
+HIST_EVERY_S = 30          # all-pairs mid-price snapshot cadence
+HIST_WINDOW_S = 1200       # keep 20 min of history
+
 
 def sim_fills(side, op, trades, queue, filled, target):
     """Queue-modeled fills: trades at our price burn the queue ahead first, only the
@@ -284,14 +352,18 @@ def book_flip(st, now):
     st["cash"] += pnl
     st["flips"].append({"t": now, "sym": st["symbol"], "qty": st["qty"],
                         "buy": st["buy_cost"] / st["qty"], "sell": st["proceeds"] / st["qty"],
-                        "fees": fees, "pnl": pnl})
-    st["state"] = "idle"
+                        "fees": fees, "pnl": pnl, "strat": st.get("strat", "mm")})
+    st.update(state="idle", strat="mm")
     return pnl
 
 
 def enter_sell(st, ask, ask_qty, now):
     st.update(state="selling", qty=st["filled"], buy_cost=st["filled"] * st["order_price"],
               order_price=ask, queue=ask_qty, filled=0.0, proceeds=0.0, sell_t=now)
+    if st.get("strat") == "crash":
+        # research exit: fixed limit at entry+2%; a fresh level above the book, so no queue ahead
+        tgt = st["buy_cost"] / st["qty"] * (1 + CRASH_TARGET)
+        st.update(order_price=tgt, queue=0.0)
 
 
 def step(st, bid, ask, bid_qty, ask_qty, trades, now):
@@ -310,13 +382,16 @@ def step(st, bid, ask, bid_qty, ask_qty, trades, now):
                                               st["queue"], st["filled"], st["qty"])
         if st["filled"] >= st["qty"] * (1 - EPS):
             enter_sell(st, ask, ask_qty, now)
-            return f"buy filled, SELL {st['qty']:.6f} @ {ask} (${ask_qty*ask:,.0f} queued ahead)"
-        if bid > st["order_price"] or now - st["opened"] > BUY_TIMEOUT_S:
+            return f"buy filled, SELL {st['qty']:.6f} @ {st['order_price']:.6g}"
+        # crash buys are fill-or-forget; MM buys cancel only when OUTBID — a resting order
+        # still at the best bid keeps its queue position (cancelling re-joins the back)
+        stale = (st.get("strat") == "crash" and now - st["opened"] > CRASH_BUY_TIMEOUT_S)
+        if bid > st["order_price"] or stale:
             if st["filled"] > 0:
                 partial = st["filled"]
                 enter_sell(st, ask, ask_qty, now)
                 return f"buy outbid/stale at {partial/st['qty']*100:.0f}% filled, selling the partial"
-            st["state"] = "idle"
+            st.update(state="idle", strat="mm")
             return "buy stale/outbid with no fill, requoting next step"
         return (f"buying @ {st['order_price']} ({st['filled']/st['qty']*100:.0f}% filled, "
                 f"${st['queue']*st['order_price']:,.0f} still ahead)")
@@ -329,11 +404,12 @@ def step(st, bid, ask, bid_qty, ask_qty, trades, now):
         if st["filled"] >= st["qty"] * (1 - EPS):
             pnl = book_flip(st, now)
             return f"SOLD, pnl ${pnl:+.4f}, cash ${st['cash']:.2f}"
-        if now - st["sell_t"] > SELL_DUMP_S:
+        dump_after = CRASH_DUMP_S if st.get("strat") == "crash" else SELL_DUMP_S
+        if now - st["sell_t"] > dump_after:
             st["proceeds"] += (st["qty"] - st["filled"]) * bid
             pnl = book_flip(st, now)
             return f"sell timed out, DUMPED remainder at bid, pnl ${pnl:+.4f}, cash ${st['cash']:.2f}"
-        if ask < st["order_price"]:
+        if ask < st["order_price"] and st.get("strat") != "crash":   # crash target is fixed, no chasing
             st.update(order_price=ask, queue=ask_qty)
             return f"undercut, sell repriced to {ask} (${ask_qty*ask:,.0f} queued ahead)"
         return (f"selling @ {st['order_price']} ({st['filled']/st['qty']*100:.0f}% filled, "
@@ -414,19 +490,37 @@ def cmd_test():
     assert st["state"] == "idle" and len(st["flips"]) == 1 and st["cash"] > 50.0, st
     exp = 0.5 * 100.5 - 50.0 - (50.0 + 0.5 * 100.5) * FEE
     assert abs(st["flips"][0]["pnl"] - exp) < 1e-9
-    # partial buy that goes stale sells what it got; zero-fill stale requotes
+    # partially-filled buy that gets OUTBID sells what it got
     st = fresh()
     step(st, 100.0, 100.5, 1.0, 5.0, [], 0)
     step(st, 100.0, 100.5, 1.0, 5.0, [{"p": "100.0", "q": "1.2"}], 1)      # 0.2 partial
-    step(st, 100.0, 100.5, 1.0, 5.0, [], BUY_TIMEOUT_S + 2)
+    step(st, 100.1, 100.5, 1.0, 5.0, [], 2)                                # outbid
     assert st["state"] == "selling" and abs(st["qty"] - 0.2) < 1e-12, st
     # unsold past SELL_DUMP_S dumps at bid and books the flip
-    step(st, 99.0, 100.5, 1.0, 5.0, [], BUY_TIMEOUT_S + 3 + SELL_DUMP_S)
+    step(st, 99.0, 100.5, 1.0, 5.0, [], 3 + SELL_DUMP_S)
     assert st["state"] == "idle" and len(st["flips"]) == 1 and st["flips"][0]["pnl"] < 0
+    # MM buy at the best bid is NEVER cancelled on a timer (queue position is earned)
     st = fresh()
     step(st, 100.0, 100.5, 1.0, 5.0, [], 0)
-    step(st, 100.0, 100.5, 1.0, 5.0, [], BUY_TIMEOUT_S + 1)
+    step(st, 100.0, 100.5, 1.0, 5.0, [], BUY_TIMEOUT_S * 10)
+    assert st["state"] == "buying"
+    step(st, 100.1, 100.5, 1.0, 5.0, [], BUY_TIMEOUT_S * 10 + 1)   # outbid -> cancel
     assert st["state"] == "idle"
+    # crash flip: fill-or-forget buy, fixed +2% target with no queue, books ~+2% - fees
+    st = fresh()
+    st.update(state="buying", strat="crash", order_price=100.0, qty=0.5,
+              queue=3.0, filled=0.0, opened=0)
+    step(st, 99.0, 99.5, 1.0, 5.0, [{"p": "98.0", "q": "1"}], 1)   # through -> filled
+    assert st["state"] == "selling" and st["order_price"] == 102.0 and st["queue"] == 0.0, st
+    step(st, 99.0, 99.5, 1.0, 5.0, [{"p": "102.5", "q": "0.6"}], 2)
+    assert st["state"] == "idle" and st["strat"] == "mm" and st["flips"][-1]["strat"] == "crash"
+    assert abs(st["flips"][-1]["pnl"] - (0.5 * 102 - 50 - (50 + 51) * FEE)) < 1e-9
+    # unfilled crash buy forgets itself after CRASH_BUY_TIMEOUT_S
+    st = fresh()
+    st.update(state="buying", strat="crash", order_price=100.0, qty=0.5,
+              queue=3.0, filled=0.0, opened=0)
+    step(st, 100.0, 100.5, 1.0, 5.0, [], CRASH_BUY_TIMEOUT_S + 1)
+    assert st["state"] == "idle" and st["strat"] == "mm"
     # symbol picking: idle retargets to best candidate, busy states never switch
     cands = [enrich({"symbol": "BBBUSDT", "net_pct": 0.5, "gross_pct": 0.7, "vol24h": 1e6}, 50)]
     assert choose_symbol(st, cands).startswith("picked BBBUSDT") and st["symbol"] == "BBBUSDT"
