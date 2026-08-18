@@ -23,3 +23,4 @@ jobs:
           git diff --cached --quiet && exit 0
           git commit -m "step $(date -u +%FT%TZ)"
           git pull --rebase && git push
+# hosted paper trader
