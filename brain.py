@@ -174,6 +174,8 @@ def cmd_paper(symbol, cash):
     if LOCAL_STATE.exists():
         st = json.loads(LOCAL_STATE.read_text())
         print(f"resumed {st['symbol']}: cash ${st['cash']:.4f}, {len(st['flips'])} flips, state {st['state']}")
+        if st["state"] != "idle" and "queue" not in st:
+            st["state"] = "idle"    # state written by pre-queue-model code; drop the open flip
     else:
         st = {"symbol": symbol, "cash": cash, "start_cash": cash, "start_t": time.time(),
               "state": "idle", "order_price": 0, "qty": 0, "buy_cost": 0, "opened": 0,
@@ -357,6 +359,8 @@ def write_status(st, line):
 def cmd_step(symbol, cash):
     if STATE.exists():
         st = json.loads(STATE.read_text())
+        if st["state"] != "idle" and "queue" not in st:
+            st["state"] = "idle"    # state written by pre-queue-model code; drop the open flip
     else:
         st = {"symbol": symbol, "cash": cash, "start_cash": cash, "start_t": time.time(),
               "state": "idle", "order_price": 0, "qty": 0, "buy_cost": 0, "opened": 0,
