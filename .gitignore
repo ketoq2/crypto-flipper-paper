@@ -2,3 +2,4 @@ __pycache__/
 paper.db
 flipper.db
 state-local.json
+research/data/
