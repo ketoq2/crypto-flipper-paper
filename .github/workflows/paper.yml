@@ -1,0 +1,25 @@
+name: paper-step
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: paper-step
+  cancel-in-progress: false
+jobs:
+  step:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install certifi
+      - run: python3 -u brain.py --step ONEUSDT --cash 50
+      - run: |
+          git config user.name paper-bot
+          git config user.email paper-bot@users.noreply.github.com
+          git add state.json STATUS.md
+          git diff --cached --quiet && exit 0
+          git commit -m "step $(date -u +%FT%TZ)"
+          git pull --rebase && git push
