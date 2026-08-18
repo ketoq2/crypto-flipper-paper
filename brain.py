@@ -96,31 +96,87 @@ def crossed(order_side, order_price, trades):
 
 
 LOCAL_STATE = Path(__file__).with_name("state-local.json")   # NOT git-tracked (hosted owns state.json)
+SCAN_EVERY_S = 300
 
 
-def html_status(st, line):
+def enrich(c, notional):
+    """Add per-flip economics to a scan candidate: expected $ and rough fill estimate."""
+    c["exp"] = notional * c["net_pct"] / 100
+    # ponytail: GE-style rough estimate — our notional vs pair's per-minute volume, 4x competition factor
+    c["fill_min"] = notional / max(c["vol24h"] / 1440, 1e-9) * 4
+    c["why"] = (f"{c['net_pct']:.3f}% net after {ROUND_TRIP_FEE*100:.2f}% fees "
+                f"({c['gross_pct']:.3f}% gross), ${c['vol24h']:,.0f}/24h vol, "
+                f"~{c['fill_min']:.1f}m/leg est")
+    return c
+
+
+def choose_symbol(st, cands):
+    """When idle, retarget to the best candidate (like GE brain picking its next item)."""
+    if st["state"] == "idle" and cands and cands[0]["net_pct"] > 0 and cands[0]["symbol"] != st["symbol"]:
+        st["symbol"], st["last_id"] = cands[0]["symbol"], None
+        return f"picked {cands[0]['symbol']}: {cands[0]['why']}"
+    return None
+
+
+def fmt_t(t):
+    return time.strftime("%m-%d %H:%M:%S", time.localtime(t))
+
+
+def html_status(st, shared):
     now = time.time()
     days = max((now - st["start_t"]) / 86400, 1e-9)
     pct = (st["cash"] / st["start_cash"] - 1) * 100
-    kpi = [("Cash", f"${st['cash']:.4f}"), ("Total", f"{pct:+.3f}%"),
-           ("Per day", f"{pct/days:+.3f}%"), ("Flips", str(len(st["flips"]))),
-           ("State", st["state"]), ("Uptime", f"{days:.2f}d")]
+    open_exp = ""
+    if st["state"] != "idle":
+        notional = st["qty"] * st["order_price"]
+        cand = next((c for c in shared["cands"] if c["symbol"] == st["symbol"]), None)
+        exp = f"{cand['exp']:+.4f}" if cand else "?"
+        fill = f"~{cand['fill_min']:.1f}m" if cand else "?"
+        open_exp = (f"<tr><td>{st['symbol']}</td><td>{'buy' if st['state']=='buying' else 'sell'}</td>"
+                    f"<td>{st['order_price']:.6g}</td><td>{st['qty']:.4f}</td><td>${notional:.2f}</td>"
+                    f"<td>{exp}</td><td>{(now-st['opened'])/60:.1f}m</td><td>{fill}</td></tr>")
+    deployed = (st["qty"] * st["order_price"] if st["state"] == "buying"
+                else st["buy_cost"] if st["state"] == "selling" else 0)
+    cand = next((c for c in shared["cands"] if c["symbol"] == st["symbol"]), None)
+    kpi = [("Bankroll", f"${st['cash']:.4f}"), ("Deployed", f"${deployed:.2f}"),
+           ("Free cash", f"${st['cash'] - deployed:.2f}"),
+           ("Realized P/L", f"${sum(f['pnl'] for f in st['flips']):+.4f}"),
+           ("Open exp P/L", f"${cand['exp']:+.4f}" if cand and st["state"] != "idle" else "—"),
+           ("Total", f"{pct:+.3f}%"), ("Per day", f"{pct/days:+.3f}%"),
+           ("Flips done", str(len(st["flips"]))), ("State", st["state"]), ("Uptime", f"{days:.2f}d"),
+           ("Scan", f"{len(shared['cands'])} pairs" if shared["cands"] else "warming up")]
     cards = "".join(f"<div class=c><div class=k>{k}</div><div class=v>{v}</div></div>" for k, v in kpi)
-    order = (f"{st['state']} {st['qty']:.4f} @ {st['order_price']:.6g}"
-             if st["state"] != "idle" else "no open order")
-    rows = "".join(f"<tr><td>{time.strftime('%m-%d %H:%M', time.localtime(f['t']))}</td>"
-                   f"<td>{f['qty']:.4f}</td><td>{f['buy']:.6g}</td><td>{f['sell']:.6g}</td>"
-                   f"<td>{f['pnl']:+.4f}</td></tr>" for f in reversed(st["flips"][-30:]))
-    return f"""<!doctype html><meta http-equiv=refresh content=8><title>Paper — {st['symbol']}</title>
+    nxt = "".join(f"<tr><td>{'★ ' if i == 0 else ''}{c['symbol']}{' (current)' if c['symbol'] == st['symbol'] else ''}</td>"
+                  f"<td>{c['gross_pct']:.3f}</td><td>{c['net_pct']:.3f}</td><td>{c['vol24h']:,.0f}</td>"
+                  f"<td>{c['exp']:+.4f}</td><td>{c['fill_min']:.1f}</td>"
+                  f"<td class=l>{c['why']}</td></tr>" for i, c in enumerate(shared["cands"][:12]))
+    flips = "".join(f"<tr><td>{fmt_t(f['t'])}</td><td>{f.get('sym', st['symbol'])}</td>"
+                    f"<td>{f['qty']:.4f}</td><td>{f['buy']:.6g}</td><td>{f['sell']:.6g}</td>"
+                    f"<td>{f['fees']:.4f}</td><td>{f['pnl']:+.4f}</td></tr>" for f in reversed(st["flips"][-30:]))
+    decisions = "".join(f"<tr><td>{fmt_t(d['t'])}</td><td class=l>{d['line']}</td></tr>"
+                        for d in reversed(st.get("log", [])[-40:]))
+    return f"""<!doctype html><meta http-equiv=refresh content=8><title>Paper trader</title>
 <style>body{{font-family:-apple-system,sans-serif;background:#14171c;color:#dde;margin:24px}}
 .cards{{display:flex;gap:12px;flex-wrap:wrap}}.c{{background:#1e232b;border-radius:8px;padding:12px 18px}}
 .k{{color:#8899aa;font-size:12px}}.v{{font-size:20px;font-weight:600}}
-table{{border-collapse:collapse;margin-top:16px}}td,th{{padding:4px 12px;border-bottom:1px solid #2a303a;text-align:right}}
-.note{{color:#8899aa;margin-top:12px;font-size:13px}}</style>
-<h2>Paper trader — {st['symbol']} (local fast loop)</h2><div class=cards>{cards}</div>
-<p>Open order: {order}<br>Last: {line}</p>
-<table><tr><th>closed</th><th>qty</th><th>buy</th><th>sell</th><th>pnl $</th></tr>{rows}</table>
-<p class=note>Fills are OPTIMISTIC (front-of-queue assumed) — all P&L is a ceiling. Hosted 15-min twin:
+h3{{margin:22px 0 6px}}table{{border-collapse:collapse}}td,th{{padding:4px 12px;border-bottom:1px solid #2a303a;text-align:right;font-size:13px}}
+td.l,th.l{{text-align:left}}.note{{color:#8899aa;margin-top:12px;font-size:13px}}</style>
+<h2>Paper trader — local fast loop</h2>
+<p class=note>Rules: pick the pair with the widest spread after fees (rescans every {SCAN_EVERY_S//60}m) ·
+quote buy at best bid only when spread &gt; {ROUND_TRIP_FEE*100:.2f}% round-trip fees · on fill, sell at best ask,
+chase down if undercut · requote if outbid · buy timeout {BUY_TIMEOUT_S//60}m · fee {FEE*100:.1f}%/side ·
+bankroll fully deployed on one flip at a time.</p>
+<div class=cards>{cards}</div>
+<h3>Open flip</h3>
+<table><tr><th class=l>pair</th><th>side</th><th>price</th><th>qty</th><th>notional</th><th>exp P/L $</th><th>elapsed</th><th>est fill</th></tr>
+{open_exp or '<tr><td colspan=8>none — waiting for a spread that beats fees</td></tr>'}</table>
+<h3>Next buys (what it will buy and why — ★ = next up)</h3>
+<table><tr><th class=l>pair</th><th>gross %</th><th>net %</th><th>vol 24h $</th><th>exp $/flip</th><th>est m/leg</th><th class=l>why</th></tr>{nxt}</table>
+<h3>Flips done</h3>
+<table><tr><th>closed</th><th>pair</th><th>qty</th><th>buy</th><th>sell</th><th>fees $</th><th>pnl $</th></tr>{flips}</table>
+<h3>Decisions</h3><table><tr><th>when</th><th class=l>decision</th></tr>{decisions}</table>
+<p class=note>Fills are OPTIMISTIC (front-of-queue assumed) — all P&L is a ceiling, real results would be worse.
+Est fill = notional / per-minute volume × 4 (rough). Hosted 15-min twin (fixed ONEUSDT):
 <a style="color:#7ab" href="https://github.com/ketoq2/crypto-flipper-paper/blob/master/STATUS.md">STATUS.md</a></p>"""
 
 
@@ -132,11 +188,27 @@ def cmd_paper(symbol, cash):
         st = {"symbol": symbol, "cash": cash, "start_cash": cash, "start_t": time.time(),
               "state": "idle", "order_price": 0, "qty": 0, "buy_cost": 0, "opened": 0,
               "last_id": None, "flips": []}
-    shared = {"line": "starting"}
+    st.setdefault("log", [])
+    shared = {"line": "starting", "cands": []}
+
+    def note(line):
+        print(f"[{time.strftime('%H:%M:%S')}] {line}")
+        st["log"] = (st["log"] + [{"t": time.time(), "line": line}])[-60:]
+
+    def scanner():
+        while True:
+            try:
+                cands = scan_candidates(get("ticker/bookTicker"), get("ticker/24hr"))
+                shared["cands"] = [enrich(c, st["cash"]) for c in cands[:15]]
+            except Exception as e:
+                print(f"[warn] scan: {e}")
+            time.sleep(SCAN_EVERY_S)
+
+    threading.Thread(target=scanner, daemon=True).start()
 
     class H(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
-            body = html_status(st, shared["line"]).encode()
+            body = html_status(st, shared).encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
@@ -148,11 +220,14 @@ def cmd_paper(symbol, cash):
     print(f"paper-trading {st['symbol']}, fee {FEE*100:.1f}%/side, dashboard http://127.0.0.1:{DASH_PORT}")
     while True:
         try:
+            picked = choose_symbol(st, shared["cands"])
+            if picked:
+                note(picked)
             book = get("ticker/bookTicker", {"symbol": st["symbol"]})
             trades, st["last_id"] = trades_since(st["symbol"], st["last_id"])
             line = step(st, float(book["bidPrice"]), float(book["askPrice"]), trades, time.time())
             if line != shared["line"]:
-                print(f"[{time.strftime('%H:%M:%S')}] {line}")
+                note(line)
             shared["line"] = line
             LOCAL_STATE.write_text(json.dumps(st))
             time.sleep(3)
@@ -209,7 +284,8 @@ def step(st, bid, ask, trades, now):
             fees = (st["buy_cost"] + proceeds) * FEE
             pnl = proceeds - st["buy_cost"] - fees
             st["cash"] += pnl
-            st["flips"].append({"t": now, "qty": st["qty"], "buy": st["buy_cost"] / st["qty"],
+            st["flips"].append({"t": now, "sym": st["symbol"], "qty": st["qty"],
+                                "buy": st["buy_cost"] / st["qty"],
                                 "sell": st["order_price"], "fees": fees, "pnl": pnl})
             st["state"] = "idle"
             return f"SOLD, pnl ${pnl:+.4f}, cash ${st['cash']:.2f}"
@@ -283,6 +359,12 @@ def cmd_test():
     # stale buy times out back to idle
     step(st, 100.0, 100.5, [], 3);            assert st["state"] == "buying"
     step(st, 100.0, 100.5, [], 3 + BUY_TIMEOUT_S + 1); assert st["state"] == "idle"
+    # symbol picking: idle retargets to best candidate, busy states never switch
+    cands = [enrich({"symbol": "BBBUSDT", "net_pct": 0.5, "gross_pct": 0.7, "vol24h": 1e6}, 50)]
+    assert choose_symbol(st, cands).startswith("picked BBBUSDT") and st["symbol"] == "BBBUSDT"
+    st["state"] = "buying"
+    assert choose_symbol(st, [dict(cands[0], symbol="CCCUSDT")]) is None
+    assert cands[0]["exp"] == 50 * 0.5 / 100 and cands[0]["fill_min"] > 0
     print("self-checks OK")
 
 
