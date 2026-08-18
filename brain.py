@@ -10,7 +10,7 @@ Modes:
 NO real orders. NO API keys. Public endpoints only.
 Paper fills are OPTIMISTIC (assume front of queue): real results will be worse.
 """
-import argparse, json, sqlite3, ssl, sys, time, urllib.request
+import argparse, http.server, json, ssl, sys, threading, time, urllib.request
 from pathlib import Path
 
 import certifi
@@ -22,7 +22,7 @@ API = BASES[-1]
 FEE = 0.001          # 0.1% spot fee per side (default tier, no BNB discount)
 ROUND_TRIP_FEE = 2 * FEE
 MIN_QUOTE_VOL_24H = 200_000   # $/day; below this fills take too long to matter
-DB = Path(__file__).with_name("paper.db")
+DASH_PORT = 8438              # GE brain uses 8437
 CTX = ssl.create_default_context(cafile=certifi.where())  # same Mac SSL fix as GE brain
 
 
@@ -84,27 +84,6 @@ def cmd_scan():
 
 # ---------- paper loop ----------
 
-def db_init():
-    db = sqlite3.connect(DB)
-    db.execute("""CREATE TABLE IF NOT EXISTS flips(
-        id INTEGER PRIMARY KEY, symbol TEXT, qty REAL,
-        buy_price REAL, sell_price REAL, fees REAL, pnl REAL,
-        opened REAL, closed REAL, state TEXT)""")
-    db.commit()
-    return db
-
-
-def fresh_trades(symbol, last_id):
-    """Trades since last_id. last_id None -> just establish position."""
-    trades = get("aggTrades", {"symbol": symbol, "limit": 200})
-    if not trades:
-        return [], last_id
-    if last_id is None:
-        return [], trades[-1]["a"]
-    new = [t for t in trades if t["a"] > last_id]
-    return new, trades[-1]["a"]
-
-
 def crossed(order_side, order_price, trades):
     """Optimistic fill: any trade at-or-through our price."""
     for t in trades:
@@ -116,51 +95,69 @@ def crossed(order_side, order_price, trades):
     return False
 
 
+LOCAL_STATE = Path(__file__).with_name("state-local.json")   # NOT git-tracked (hosted owns state.json)
+
+
+def html_status(st, line):
+    now = time.time()
+    days = max((now - st["start_t"]) / 86400, 1e-9)
+    pct = (st["cash"] / st["start_cash"] - 1) * 100
+    kpi = [("Cash", f"${st['cash']:.4f}"), ("Total", f"{pct:+.3f}%"),
+           ("Per day", f"{pct/days:+.3f}%"), ("Flips", str(len(st["flips"]))),
+           ("State", st["state"]), ("Uptime", f"{days:.2f}d")]
+    cards = "".join(f"<div class=c><div class=k>{k}</div><div class=v>{v}</div></div>" for k, v in kpi)
+    order = (f"{st['state']} {st['qty']:.4f} @ {st['order_price']:.6g}"
+             if st["state"] != "idle" else "no open order")
+    rows = "".join(f"<tr><td>{time.strftime('%m-%d %H:%M', time.localtime(f['t']))}</td>"
+                   f"<td>{f['qty']:.4f}</td><td>{f['buy']:.6g}</td><td>{f['sell']:.6g}</td>"
+                   f"<td>{f['pnl']:+.4f}</td></tr>" for f in reversed(st["flips"][-30:]))
+    return f"""<!doctype html><meta http-equiv=refresh content=8><title>Paper — {st['symbol']}</title>
+<style>body{{font-family:-apple-system,sans-serif;background:#14171c;color:#dde;margin:24px}}
+.cards{{display:flex;gap:12px;flex-wrap:wrap}}.c{{background:#1e232b;border-radius:8px;padding:12px 18px}}
+.k{{color:#8899aa;font-size:12px}}.v{{font-size:20px;font-weight:600}}
+table{{border-collapse:collapse;margin-top:16px}}td,th{{padding:4px 12px;border-bottom:1px solid #2a303a;text-align:right}}
+.note{{color:#8899aa;margin-top:12px;font-size:13px}}</style>
+<h2>Paper trader — {st['symbol']} (local fast loop)</h2><div class=cards>{cards}</div>
+<p>Open order: {order}<br>Last: {line}</p>
+<table><tr><th>closed</th><th>qty</th><th>buy</th><th>sell</th><th>pnl $</th></tr>{rows}</table>
+<p class=note>Fills are OPTIMISTIC (front-of-queue assumed) — all P&L is a ceiling. Hosted 15-min twin:
+<a style="color:#7ab" href="https://github.com/ketoq2/crypto-flipper-paper/blob/master/STATUS.md">STATUS.md</a></p>"""
+
+
 def cmd_paper(symbol, cash):
-    db = db_init()
-    last_id = None
-    state, order_price, qty, buy_cost = "idle", 0.0, 0.0, 0.0
-    opened = 0.0
-    start_cash, start_t = cash, time.time()
-    print(f"paper-trading {symbol}, bankroll ${cash:.2f}, fee {FEE*100:.1f}%/side. Ctrl-C to stop.")
+    if LOCAL_STATE.exists():
+        st = json.loads(LOCAL_STATE.read_text())
+        print(f"resumed {st['symbol']}: cash ${st['cash']:.4f}, {len(st['flips'])} flips, state {st['state']}")
+    else:
+        st = {"symbol": symbol, "cash": cash, "start_cash": cash, "start_t": time.time(),
+              "state": "idle", "order_price": 0, "qty": 0, "buy_cost": 0, "opened": 0,
+              "last_id": None, "flips": []}
+    shared = {"line": "starting"}
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = html_status(st, shared["line"]).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(body)
+        def log_message(self, *a): pass
+
+    threading.Thread(target=http.server.ThreadingHTTPServer(("127.0.0.1", DASH_PORT), H).serve_forever,
+                     daemon=True).start()
+    print(f"paper-trading {st['symbol']}, fee {FEE*100:.1f}%/side, dashboard http://127.0.0.1:{DASH_PORT}")
     while True:
         try:
-            book = get("ticker/bookTicker", {"symbol": symbol})
-            bid, ask = float(book["bidPrice"]), float(book["askPrice"])
-            trades, last_id = fresh_trades(symbol, last_id)
-
-            if state == "idle":
-                mid = (bid + ask) / 2
-                if (ask - bid) / mid > ROUND_TRIP_FEE:      # only quote when spread beats fees
-                    order_price, qty = bid, cash / bid
-                    state, opened = "buying", time.time()
-                    print(f"[{time.strftime('%H:%M:%S')}] BUY {qty:.6f} @ {order_price} (spread {(ask-bid)/mid*100:.3f}%)")
-            elif state == "buying":
-                if crossed("buy", order_price, trades):
-                    buy_cost = qty * order_price
-                    state, order_price = "selling", ask
-                    print(f"[{time.strftime('%H:%M:%S')}] filled buy, SELL @ {order_price}")
-                elif bid > order_price or time.time() - opened > 600:
-                    state = "idle"                           # price left us behind / stale; re-quote
-            elif state == "selling":
-                if crossed("sell", order_price, trades):
-                    proceeds = qty * order_price
-                    fees = (buy_cost + proceeds) * FEE
-                    pnl = proceeds - buy_cost - fees
-                    cash += pnl
-                    db.execute("INSERT INTO flips(symbol,qty,buy_price,sell_price,fees,pnl,opened,closed,state)"
-                               " VALUES(?,?,?,?,?,?,?,?,?)",
-                               (symbol, qty, buy_cost / qty, order_price, fees, pnl, opened, time.time(), "done"))
-                    db.commit()
-                    hrs = (time.time() - start_t) / 3600
-                    print(f"[{time.strftime('%H:%M:%S')}] SOLD. pnl ${pnl:+.4f}  cash ${cash:.2f}  "
-                          f"({(cash/start_cash-1)*100:+.3f}% in {hrs:.2f}h)")
-                    state = "idle"
-                elif ask < order_price:                      # undercut; chase down once per tick
-                    order_price = ask
+            book = get("ticker/bookTicker", {"symbol": st["symbol"]})
+            trades, st["last_id"] = trades_since(st["symbol"], st["last_id"])
+            line = step(st, float(book["bidPrice"]), float(book["askPrice"]), trades, time.time())
+            if line != shared["line"]:
+                print(f"[{time.strftime('%H:%M:%S')}] {line}")
+            shared["line"] = line
+            LOCAL_STATE.write_text(json.dumps(st))
             time.sleep(3)
         except KeyboardInterrupt:
-            print(f"\nstopped. cash ${cash:.2f} ({(cash/start_cash-1)*100:+.3f}%), db: {DB}")
+            print(f"\nstopped. cash ${st['cash']:.2f}, state saved to {LOCAL_STATE}")
             return
         except Exception as e:
             print(f"[warn] {e}; retrying")
