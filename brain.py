@@ -8,7 +8,8 @@ Modes:
   --cash 50           paper bankroll in USDT
 
 NO real orders. NO API keys. Public endpoints only.
-Paper fills are OPTIMISTIC (assume front of queue): real results will be worse.
+Fills are queue-modeled: orders wait behind the resting size at their price (bookTicker
+qty at placement); cancellations ahead are unobservable and assumed to never happen.
 """
 import argparse, http.server, json, ssl, sys, threading, time, urllib.request
 from pathlib import Path
@@ -83,17 +84,6 @@ def cmd_scan():
 
 
 # ---------- paper loop ----------
-
-def crossed(order_side, order_price, trades):
-    """Optimistic fill: any trade at-or-through our price."""
-    for t in trades:
-        p = float(t["p"])
-        if order_side == "buy" and p <= order_price:
-            return True
-        if order_side == "sell" and p >= order_price:
-            return True
-    return False
-
 
 LOCAL_STATE = Path(__file__).with_name("state-local.json")   # NOT git-tracked (hosted owns state.json)
 SCAN_EVERY_S = 300
@@ -175,7 +165,7 @@ bankroll fully deployed on one flip at a time.</p>
 <h3>Flips done</h3>
 <table><tr><th>closed</th><th>pair</th><th>qty</th><th>buy</th><th>sell</th><th>fees $</th><th>pnl $</th></tr>{flips}</table>
 <h3>Decisions</h3><table><tr><th>when</th><th class=l>decision</th></tr>{decisions}</table>
-<p class=note>Fills are OPTIMISTIC (front-of-queue assumed) — all P&L is a ceiling, real results would be worse.
+<p class=note>Fills are queue-modeled: orders wait behind the resting size at their price; cancels ahead assumed never (conservative). Icebergs/hidden size not visible.
 Est fill = notional / per-minute volume × 4 (rough). Hosted 15-min twin (fixed ONEUSDT):
 <a style="color:#7ab" href="https://github.com/ketoq2/crypto-flipper-paper/blob/master/STATUS.md">STATUS.md</a></p>"""
 
@@ -225,7 +215,8 @@ def cmd_paper(symbol, cash):
                 note(picked)
             book = get("ticker/bookTicker", {"symbol": st["symbol"]})
             trades, st["last_id"] = trades_since(st["symbol"], st["last_id"])
-            line = step(st, float(book["bidPrice"]), float(book["askPrice"]), trades, time.time())
+            line = step(st, float(book["bidPrice"]), float(book["askPrice"]),
+                        float(book["bidQty"]), float(book["askQty"]), trades, time.time())
             if line != shared["line"]:
                 note(line)
             shared["line"] = line
@@ -262,37 +253,89 @@ def trades_since(symbol, last_id):
     return out, (out[-1]["a"] if out else last_id)
 
 
-def step(st, bid, ask, trades, now):
+SELL_DUMP_S = 2 * 3600   # unsold after 2h -> dump remainder at the bid (cross the spread to exit)
+EPS = 1e-9
+
+
+def sim_fills(side, op, trades, queue, filled, target):
+    """Queue-modeled fills: trades at our price burn the queue ahead first, only the
+    overflow fills us; a trade through our price fills everything. Cancellations ahead
+    are unobservable -> assumed none (conservative). Returns (queue, filled)."""
+    for t in trades:
+        if filled >= target:
+            break
+        p, q = float(t["p"]), float(t["q"])
+        through = p < op * (1 - EPS) if side == "buy" else p > op * (1 + EPS)
+        at_level = abs(p - op) <= op * EPS
+        if through:
+            return 0.0, target
+        if at_level:
+            take = min(q, queue)
+            queue -= take
+            filled = min(target, filled + (q - take))
+    return queue, filled
+
+
+def book_flip(st, now):
+    fees = (st["buy_cost"] + st["proceeds"]) * FEE
+    pnl = st["proceeds"] - st["buy_cost"] - fees
+    st["cash"] += pnl
+    st["flips"].append({"t": now, "sym": st["symbol"], "qty": st["qty"],
+                        "buy": st["buy_cost"] / st["qty"], "sell": st["proceeds"] / st["qty"],
+                        "fees": fees, "pnl": pnl})
+    st["state"] = "idle"
+    return pnl
+
+
+def enter_sell(st, ask, ask_qty, now):
+    st.update(state="selling", qty=st["filled"], buy_cost=st["filled"] * st["order_price"],
+              order_price=ask, queue=ask_qty, filled=0.0, proceeds=0.0, sell_t=now)
+
+
+def step(st, bid, ask, bid_qty, ask_qty, trades, now):
     """One decision tick on state dict st. Returns a one-line status string."""
     mid = (bid + ask) / 2
     if st["state"] == "idle":
         if (ask - bid) / mid > ROUND_TRIP_FEE:
-            st.update(state="buying", order_price=bid, qty=st["cash"] / bid, opened=now)
-            return f"BUY {st['qty']:.6f} @ {bid} (spread {(ask-bid)/mid*100:.3f}%)"
+            st.update(state="buying", order_price=bid, qty=st["cash"] / bid,
+                      queue=bid_qty, filled=0.0, opened=now)
+            return (f"BUY {st['qty']:.6f} @ {bid} (spread {(ask-bid)/mid*100:.3f}%, "
+                    f"${bid_qty*bid:,.0f} queued ahead)")
         return f"idle, spread {(ask-bid)/mid*100:.3f}% < fees"
+
     if st["state"] == "buying":
-        if crossed("buy", st["order_price"], trades):
-            st.update(state="selling", buy_cost=st["qty"] * st["order_price"], order_price=ask)
-            return f"buy filled, SELL @ {ask}"
+        st["queue"], st["filled"] = sim_fills("buy", st["order_price"], trades,
+                                              st["queue"], st["filled"], st["qty"])
+        if st["filled"] >= st["qty"] * (1 - EPS):
+            enter_sell(st, ask, ask_qty, now)
+            return f"buy filled, SELL {st['qty']:.6f} @ {ask} (${ask_qty*ask:,.0f} queued ahead)"
         if bid > st["order_price"] or now - st["opened"] > BUY_TIMEOUT_S:
+            if st["filled"] > 0:
+                partial = st["filled"]
+                enter_sell(st, ask, ask_qty, now)
+                return f"buy outbid/stale at {partial/st['qty']*100:.0f}% filled, selling the partial"
             st["state"] = "idle"
-            return "buy stale/outbid, requoting next step"
-        return f"buying @ {st['order_price']} (bid {bid})"
+            return "buy stale/outbid with no fill, requoting next step"
+        return (f"buying @ {st['order_price']} ({st['filled']/st['qty']*100:.0f}% filled, "
+                f"${st['queue']*st['order_price']:,.0f} still ahead)")
+
     if st["state"] == "selling":
-        if crossed("sell", st["order_price"], trades):
-            proceeds = st["qty"] * st["order_price"]
-            fees = (st["buy_cost"] + proceeds) * FEE
-            pnl = proceeds - st["buy_cost"] - fees
-            st["cash"] += pnl
-            st["flips"].append({"t": now, "sym": st["symbol"], "qty": st["qty"],
-                                "buy": st["buy_cost"] / st["qty"],
-                                "sell": st["order_price"], "fees": fees, "pnl": pnl})
-            st["state"] = "idle"
+        before = st["filled"]
+        st["queue"], st["filled"] = sim_fills("sell", st["order_price"], trades,
+                                              st["queue"], st["filled"], st["qty"])
+        st["proceeds"] += (st["filled"] - before) * st["order_price"]
+        if st["filled"] >= st["qty"] * (1 - EPS):
+            pnl = book_flip(st, now)
             return f"SOLD, pnl ${pnl:+.4f}, cash ${st['cash']:.2f}"
+        if now - st["sell_t"] > SELL_DUMP_S:
+            st["proceeds"] += (st["qty"] - st["filled"]) * bid
+            pnl = book_flip(st, now)
+            return f"sell timed out, DUMPED remainder at bid, pnl ${pnl:+.4f}, cash ${st['cash']:.2f}"
         if ask < st["order_price"]:
-            st["order_price"] = ask
-            return f"undercut, sell repriced to {ask}"
-        return f"selling @ {st['order_price']} (ask {ask})"
+            st.update(order_price=ask, queue=ask_qty)
+            return f"undercut, sell repriced to {ask} (${ask_qty*ask:,.0f} queued ahead)"
+        return (f"selling @ {st['order_price']} ({st['filled']/st['qty']*100:.0f}% filled, "
+                f"${st['queue']*st['order_price']:,.0f} still ahead)")
     return "?"
 
 
@@ -307,7 +350,7 @@ def write_status(st, line):
         f"**Cash: ${st['cash']:.4f}** ({pct:+.3f}% total, {pct/days:+.3f}%/day over {days:.1f}d) — "
         f"{len(st['flips'])} flips done, state: {st['state']}\n\n"
         f"Last step (UTC {time.strftime('%F %T', time.gmtime())}): {line}\n\n"
-        f"Fills are OPTIMISTIC (front-of-queue assumed): treat all P&L as a ceiling.\n\n"
+        f"Fills are queue-modeled (wait behind resting size; cancels ahead assumed never).\n\n"
         f"| closed (UTC) | qty | buy | sell | pnl $ |\n|---|---|---|---|---|\n{rows}\n")
 
 
@@ -319,9 +362,9 @@ def cmd_step(symbol, cash):
               "state": "idle", "order_price": 0, "qty": 0, "buy_cost": 0, "opened": 0,
               "last_id": None, "flips": []}
     book = get("ticker/bookTicker", {"symbol": st["symbol"]})
-    bid, ask = float(book["bidPrice"]), float(book["askPrice"])
     trades, st["last_id"] = trades_since(st["symbol"], st["last_id"])
-    line = step(st, bid, ask, trades, time.time())
+    line = step(st, float(book["bidPrice"]), float(book["askPrice"]),
+                float(book["bidQty"]), float(book["askQty"]), trades, time.time())
     STATE.write_text(json.dumps(st))
     write_status(st, line)
     print(f"{st['symbol']} {line} | cash ${st['cash']:.4f} | {len(trades)} trades replayed")
@@ -342,23 +385,44 @@ def cmd_test():
     c = scan_candidates(book, day)
     assert [x["symbol"] for x in c] == ["AAAUSDT", "BBBUSDT"], c
     assert c[0]["net_pct"] > 0 > c[1]["net_pct"]
-    assert crossed("buy", 100, [{"p": "99.9"}]) and not crossed("buy", 100, [{"p": "100.1"}])
-    assert crossed("sell", 100, [{"p": "100.1"}]) and not crossed("sell", 100, [{"p": "99.9"}])
-    # a full flip at AAAUSDT prices must net gross-spread minus both fees
-    buy, sell, q = 100.0, 100.5, 0.5
-    pnl = q * sell - q * buy - (q * buy + q * sell) * FEE
-    assert 0 < pnl < q * (sell - buy), pnl
-    # step-mode state machine: idle->buying->selling->idle with pnl booked
-    st = {"symbol": "AAAUSDT", "cash": 50.0, "start_cash": 50.0, "start_t": 0,
-          "state": "idle", "order_price": 0, "qty": 0, "buy_cost": 0, "opened": 0,
-          "last_id": 0, "flips": []}
-    step(st, 100.0, 100.5, [], 0);            assert st["state"] == "buying"
-    step(st, 100.0, 100.5, [{"p": "99.9"}], 1); assert st["state"] == "selling"
-    step(st, 100.0, 100.5, [{"p": "100.6"}], 2)
+    # queue model: trades at our price burn the queue first, overflow fills us, through-trade fills all
+    q, f = sim_fills("buy", 100.0, [{"p": "100.0", "q": "4"}], 10.0, 0.0, 0.5)
+    assert (q, f) == (6.0, 0.0), (q, f)                    # queue absorbs it, we get nothing
+    q, f = sim_fills("buy", 100.0, [{"p": "100.0", "q": "6.2"}], 6.0, 0.0, 0.5)
+    assert q == 0.0 and abs(f - 0.2) < 1e-12, (q, f)       # 0.2 overflow -> partial fill
+    q, f = sim_fills("buy", 100.0, [{"p": "99.0", "q": "0.01"}], 999.0, 0.0, 0.5)
+    assert (q, f) == (0.0, 0.5)                            # traded through -> full fill
+    q, f = sim_fills("sell", 100.0, [{"p": "100.5", "q": "1"}], 0.0, 0.0, 0.5)
+    assert f == 0.5                                        # sell side symmetric
+    # full flip: idle -> buying (queue) -> selling (queue) -> booked with fees
+    def fresh():
+        return {"symbol": "AAAUSDT", "cash": 50.0, "start_cash": 50.0, "start_t": 0,
+                "state": "idle", "order_price": 0, "qty": 0, "buy_cost": 0, "opened": 0,
+                "last_id": 0, "flips": []}
+    st = fresh()
+    step(st, 100.0, 100.5, 10.0, 5.0, [], 0)
+    assert st["state"] == "buying" and st["queue"] == 10.0
+    step(st, 100.0, 100.5, 10.0, 5.0, [{"p": "100.0", "q": "20"}], 1)
+    assert st["state"] == "selling" and st["queue"] == 5.0 and st["buy_cost"] == 50.0
+    step(st, 100.0, 100.5, 10.0, 5.0, [{"p": "100.5", "q": "3"}], 2)
+    assert st["state"] == "selling" and st["filled"] == 0.0  # still behind the ask queue
+    step(st, 100.0, 100.5, 10.0, 5.0, [{"p": "100.5", "q": "2.5"}], 3)
     assert st["state"] == "idle" and len(st["flips"]) == 1 and st["cash"] > 50.0, st
-    # stale buy times out back to idle
-    step(st, 100.0, 100.5, [], 3);            assert st["state"] == "buying"
-    step(st, 100.0, 100.5, [], 3 + BUY_TIMEOUT_S + 1); assert st["state"] == "idle"
+    exp = 0.5 * 100.5 - 50.0 - (50.0 + 0.5 * 100.5) * FEE
+    assert abs(st["flips"][0]["pnl"] - exp) < 1e-9
+    # partial buy that goes stale sells what it got; zero-fill stale requotes
+    st = fresh()
+    step(st, 100.0, 100.5, 1.0, 5.0, [], 0)
+    step(st, 100.0, 100.5, 1.0, 5.0, [{"p": "100.0", "q": "1.2"}], 1)      # 0.2 partial
+    step(st, 100.0, 100.5, 1.0, 5.0, [], BUY_TIMEOUT_S + 2)
+    assert st["state"] == "selling" and abs(st["qty"] - 0.2) < 1e-12, st
+    # unsold past SELL_DUMP_S dumps at bid and books the flip
+    step(st, 99.0, 100.5, 1.0, 5.0, [], BUY_TIMEOUT_S + 3 + SELL_DUMP_S)
+    assert st["state"] == "idle" and len(st["flips"]) == 1 and st["flips"][0]["pnl"] < 0
+    st = fresh()
+    step(st, 100.0, 100.5, 1.0, 5.0, [], 0)
+    step(st, 100.0, 100.5, 1.0, 5.0, [], BUY_TIMEOUT_S + 1)
+    assert st["state"] == "idle"
     # symbol picking: idle retargets to best candidate, busy states never switch
     cands = [enrich({"symbol": "BBBUSDT", "net_pct": 0.5, "gross_pct": 0.7, "vol24h": 1e6}, 50)]
     assert choose_symbol(st, cands).startswith("picked BBBUSDT") and st["symbol"] == "BBBUSDT"
