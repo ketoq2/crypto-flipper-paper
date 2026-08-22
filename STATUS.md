@@ -1,8 +1,8 @@
 # Paper trader — ONEUSDT
 
-**Cash: $50.2011** (+0.402% total, +0.098%/day over 4.1d) — 26 flips done, state: buying
+**Cash: $50.2011** (+0.402% total, +0.097%/day over 4.1d) — 26 flips done, state: selling
 
-Last step (UTC 2026-08-22 09:04:26): BUY 65708.249144 @ 0.000764 (spread 0.261%, $80 queued ahead)
+Last step (UTC 2026-08-22 09:38:42): buy filled, SELL 65708.249144 @ 0.000774
 
 Fills are queue-modeled (wait behind resting size; cancels ahead assumed never).
 
