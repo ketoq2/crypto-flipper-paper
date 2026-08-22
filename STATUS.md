@@ -2,7 +2,7 @@
 
 **Cash: $49.9974** (-0.005% total, -0.001%/day over 4.0d) — 25 flips done, state: idle
 
-Last step (UTC 2026-08-22 06:21:13): SOLD, pnl $+1.0968, cash $50.00
+Last step (UTC 2026-08-22 07:07:24): idle, spread 0.122% < fees
 
 Fills are queue-modeled (wait behind resting size; cancels ahead assumed never).
 
