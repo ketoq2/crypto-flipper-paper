@@ -1,14 +1,13 @@
 # Paper trader — ONEUSDT
 
-**Cash: $43.8630** (-12.274% total, -0.435%/day over 28.2d) — 62 flips done, state: selling
+**Cash: $42.6109** (-14.778% total, -0.520%/day over 28.4d) — 63 flips done, state: idle
 
-Last step (UTC 2026-09-15 12:06:58): buy filled, SELL 61346.854948 @ 0.000696
+Last step (UTC 2026-09-15 16:54:39): SOLD, pnl $-1.2522, cash $42.61
 
 Fills are queue-modeled (wait behind resting size; cancels ahead assumed never).
 
 | closed (UTC) | qty | buy | sell | pnl $ |
 |---|---|---|---|---|
-| 08-24 20:45 | 61887.2371 | 0.000781 | 0.00078 | -0.1585 |
 | 08-24 22:49 | 64148.3874 | 0.000751 | 0.000752 | -0.0323 |
 | 08-25 10:04 | 64621.7078 | 0.000745 | 0.000745 | -0.0963 |
 | 08-25 17:45 | 65548.2755 | 0.000733 | 0.000738 | +0.2313 |
@@ -23,3 +22,4 @@ Fills are queue-modeled (wait behind resting size; cancels ahead assumed never).
 | 09-08 20:06 | 64129.2913 | 0.000713 | 0.000713 | -0.0914 |
 | 09-11 04:33 | 70204.2098 | 0.00065 | 0.000644 | -0.5121 |
 | 09-12 14:04 | 64921.8228 | 0.000695 | 0.000677 | -1.2577 |
+| 09-15 16:54 | 61346.8549 | 0.000715 | 0.000696 | -1.2522 |
