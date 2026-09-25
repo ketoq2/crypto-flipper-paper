@@ -1,8 +1,8 @@
 # Paper trader — ONEUSDT
 
-**Cash: $75.5371** (+51.074% total, +1.348%/day over 37.9d) — 69 flips done, state: idle
+**Cash: $75.5371** (+51.074% total, +1.340%/day over 38.1d) — 69 flips done, state: idle
 
-Last step (UTC 2026-09-25 04:05:31): sell timed out, DUMPED remainder at bid, pnl $+3.0787, cash $75.54
+Last step (UTC 2026-09-25 09:34:25): idle, spread 0.200% < fees
 
 Fills are queue-modeled (wait behind resting size; cancels ahead assumed never).
 
